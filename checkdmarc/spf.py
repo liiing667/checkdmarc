@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import re
@@ -755,13 +756,19 @@ def parse_spf_record(
         domain (str): The domain that the SPF record came from
         parked (bool): Indicates if a domain has been parked
         ignore_too_many_lookups (bool): Do not raise an exception for too many lookups
-        seen (list): A list of domains seen in past loops
+        seen (list): A list of domains already included in this evaluation,
+            used to warn about duplicate includes
         nameservers (list): A list of nameservers to query
         resolver (dns.resolver.Resolver): A resolver object to use for DNS requests
         recursion (list): A list of domains used in recursion
         timeout (float): number of seconds to wait for an answer from DNS
         retries (int): The number of times to retry on timeout or other transient errors
         syntax_error_marker (str): The marker for pointing out syntax errors
+        _include_cache (dict): Internal cache shared by every recursive call
+            in one evaluation. It maps an ``include``/``redirect`` target
+            domain to an immutable snapshot of its parse result, so a repeat
+            reference is counted again (RFC 7208 section 4.6.4 counts every
+            evaluated term) without re-querying DNS.
         _included (bool): Internal flag: this record was reached by following
             an ``include``
 
@@ -779,6 +786,55 @@ def parse_spf_record(
         :exc:`checkdmarc.spf.SPFSyntaxError`
         :exc:`checkdmarc.spf.SPFTooManyDNSLookups`
     """
+    warnings: list[str] = []
+    try:
+        return _parse_spf_record(
+            record,
+            domain,
+            ignore_too_many_lookups=ignore_too_many_lookups,
+            parked=parked,
+            seen=seen,
+            nameservers=nameservers,
+            resolver=resolver,
+            recursion=recursion,
+            timeout=timeout,
+            retries=retries,
+            syntax_error_marker=syntax_error_marker,
+            _include_cache=_include_cache,
+            _included=_included,
+            _warnings=warnings,
+        )
+    except SPFError as fatal:
+        # Warnings diagnosed at this level would be lost with the raise;
+        # hand them to the caller on the exception so check_spf() can
+        # report them with the error
+        fatal.warnings = warnings + fatal.warnings
+        raise
+
+
+def _parse_spf_record(
+    record: str,
+    domain: str,
+    *,
+    ignore_too_many_lookups: bool = False,
+    parked: bool = False,
+    seen: list | None = None,
+    nameservers: Sequence[str | Nameserver] | None = None,
+    resolver: dns.resolver.Resolver | None = None,
+    recursion: list[str] | None = None,
+    timeout: float = DEFAULT_DNS_TIMEOUT,
+    retries: int = DEFAULT_DNS_MAX_RETRIES,
+    syntax_error_marker: str = SYNTAX_ERROR_MARKER,
+    _include_cache: dict[str, SPFRecordResults] | None = None,
+    _included: bool = False,
+    _warnings: list[str],
+) -> SPFRecordResults:
+    """Body of :func:`parse_spf_record`, split out so the public function can
+    attach this level's warnings to any fatal error that leaves it.
+
+    Takes the same arguments as :func:`parse_spf_record`, plus ``_warnings``,
+    the list this level appends its warnings to.
+    """
     logger.debug(f"Parsing the SPF record on {domain}")
     domain = normalize_domain(domain)
 
@@ -787,16 +843,17 @@ def parse_spf_record(
     if recursion is None:
         recursion = [domain]
     if _include_cache is None:
-        # Maps an include target domain to its parse result, so that a
-        # duplicate include can be counted again (RFC 7208 section 4.6.4
-        # counts every evaluated term) without re-querying DNS.
+        # Maps an include/redirect target domain to an immutable snapshot
+        # of its parse result, so that a repeat reference can be counted
+        # again (RFC 7208 section 4.6.4 counts every evaluated term)
+        # without re-querying DNS.
         _include_cache = {}
 
     # Accept quoted TXT presentation input from direct callers too, but keep
     # literal quotes in already decoded records from query_spf_record().
     record, _ = _decode_txt_strings(record)
 
-    warnings = []
+    warnings = _warnings
     spf_syntax_checker = _SPFGrammar()
 
     if parked:
@@ -1486,7 +1543,28 @@ def parse_spf_record(
                     continue
                 if value in recursion:
                     raise SPFRedirectLoop(f"Redirect loop: {value}")
-                seen.append(value)
+                cached_redirect = _include_cache.get(value)
+                if cached_redirect is not None:
+                    # The target was already parsed during this evaluation
+                    # (by an include or an earlier redirect). Reuse the
+                    # cached immutable snapshot instead of re-querying DNS;
+                    # the redirect term still counts every lookup against
+                    # the RFC 7208 section 4.6.4 limits.
+                    mechanism_dns_lookups += cached_redirect["dns_lookups"]
+                    mechanism_void_dns_lookups += cached_redirect["void_dns_lookups"]
+                    _count_dns_lookups(cached_redirect["dns_lookups"])
+                    _count_void_dns_lookups(cached_redirect["void_dns_lookups"])
+                    parsed["all"] = cached_redirect["parsed"]["all"]
+                    cached_redirect_result: SPFRedirect = {
+                        "domain": value,
+                        "record": cached_redirect["record"],
+                        "dns_lookups": mechanism_dns_lookups,
+                        "void_dns_lookups": mechanism_void_dns_lookups,
+                        "parsed": copy.deepcopy(cached_redirect["parsed"]),
+                        "warnings": list(cached_redirect["warnings"]),
+                    }
+                    parsed["redirect"] = cached_redirect_result
+                    continue
                 try:
                     redirect_query = query_spf_record(
                         value,
@@ -1522,6 +1600,10 @@ def parse_spf_record(
                     )
                     # Merge before the lookup counters below, which can raise
                     warnings += redirected_spf["warnings"]
+                    # Cache an immutable snapshot so a repeat reference to
+                    # the same target (include or redirect) reuses it
+                    # instead of re-querying DNS
+                    _include_cache[value] = copy.deepcopy(redirected_spf)
                     parsed["all"] = redirected_spf["parsed"]["all"]
                     mechanism_dns_lookups += redirected_spf["dns_lookups"]
                     mechanism_void_dns_lookups += redirected_spf["void_dns_lookups"]
@@ -1579,28 +1661,30 @@ def parse_spf_record(
                     raise SPFIncludeLoop(f"Include loop: {pointer}")
                 if value in seen:
                     warnings.append(f"Duplicate include: {value}")
-                    cached_include = _include_cache.get(value)
-                    if cached_include is not None:
-                        # RFC 7208 section 4.6.4: real evaluation counts
-                        # every evaluated term, repeats included, so count
-                        # the duplicate again using the earlier parse result
-                        # instead of re-querying DNS.
-                        _count_dns_lookups(1 + cached_include["dns_lookups"])
-                        _count_void_dns_lookups(cached_include["void_dns_lookups"])
-                        duplicate_include_mechanism: SPFIncludeMechanism = {
-                            "action": action,
-                            "mechanism": mechanism,
-                            "value": value,
-                            "dns_lookups": 1 + cached_include["dns_lookups"],
-                            "void_dns_lookups": cached_include["void_dns_lookups"],
-                            "record": cached_include["record"],
-                            "parsed": cached_include["parsed"],
-                            "warnings": cached_include["warnings"],
-                        }
-                        parsed["mechanisms"].append(duplicate_include_mechanism)
-                        continue
                 else:
                     seen.append(value)
+                cached_include = _include_cache.get(value)
+                if cached_include is not None:
+                    # RFC 7208 section 4.6.4: real evaluation counts every
+                    # evaluated term, repeats included, so count the repeat
+                    # from the cached result — an immutable snapshot —
+                    # instead of re-querying DNS. Copies go into this
+                    # mechanism so the two occurrences share no mutable
+                    # state with each other or with the cache.
+                    _count_dns_lookups(1 + cached_include["dns_lookups"])
+                    _count_void_dns_lookups(cached_include["void_dns_lookups"])
+                    duplicate_include_mechanism: SPFIncludeMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
+                        "dns_lookups": 1 + cached_include["dns_lookups"],
+                        "void_dns_lookups": cached_include["void_dns_lookups"],
+                        "record": cached_include["record"],
+                        "parsed": copy.deepcopy(cached_include["parsed"]),
+                        "warnings": list(cached_include["warnings"]),
+                    }
+                    parsed["mechanisms"].append(duplicate_include_mechanism)
+                    continue
                 _count_dns_lookups()
                 mechanism_dns_lookups += 1
                 try:
@@ -1665,7 +1749,11 @@ def parse_spf_record(
                 include["warnings"] = include_query["warnings"] + include["warnings"]
                 # Merge before the lookup counters below, which can raise
                 warnings += include["warnings"]
-                _include_cache[value] = include
+                # Cache an immutable snapshot so a repeat include or a
+                # redirect to the same target reuses it without re-querying
+                # DNS; later edits to the returned structures can never
+                # leak into the cache
+                _include_cache[value] = copy.deepcopy(include)
                 _count_dns_lookups(include["dns_lookups"])
                 _count_void_dns_lookups(include["void_dns_lookups"])
                 mechanism_dns_lookups += include["dns_lookups"]
@@ -1729,17 +1817,16 @@ def parse_spf_record(
                 warnings += e.warnings
                 error = str(e)
             else:
-                # This level's warnings would be lost with the raise; hand
-                # them to the caller on the exception
-                e.warnings = warnings + e.warnings
+                # parse_spf_record() attaches this level's warnings to the
+                # error as it leaves this level
                 raise
-        except SPFError as fatal:
-            # Any other fatal error leaves this level too; take its warnings
-            # along so check_spf() can report them with the error
-            fatal.warnings = warnings + fatal.warnings
-            raise
 
         except (_SPFWarning, DNSException) as warning:
+            # Append before the void-lookup accounting below: if the
+            # void-lookup limit is exceeded there, the raise leaves this
+            # level, and only what is already in this list reaches the
+            # caller on the exception
+            warnings.append(f"Error when processing {value or domain}: {warning!s}")
             if isinstance(warning, (_SPFMissingRecords, DNSExceptionNXDOMAIN)):
                 mechanism_void_dns_lookups += 1
 
@@ -1752,7 +1839,6 @@ def parse_spf_record(
                 }
                 parsed["mechanisms"].append(failed_mechanism)
                 _count_void_dns_lookups()
-            warnings.append(f"Error when processing {value or domain}: {warning!s}")
 
     # RFC 6652 § 3 semantic checks run after every modifier has been recorded.
     _check_rfc6652_semantics()

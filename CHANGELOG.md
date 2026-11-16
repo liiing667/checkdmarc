@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- SPF: make evaluation with the shared include cache deterministic. A
+  `redirect=` target was added to the duplicate-include tracking list but
+  never cached, so `redirect=X` followed by `include:X` warned about a
+  spurious "Duplicate include" and re-queried DNS while the reverse order
+  did neither. Redirects now reuse the same per-evaluation cache as
+  includes, and every occurrence of an include or redirect still counts
+  against the RFC 7208 section 4.6.4 lookup budgets
+- SPF: the include cache now stores and hands out immutable snapshots, so
+  two occurrences of the same target share no mutable state
+- SPF: a fatal error raised while recording a mechanism warning (for
+  example crossing the 2-void-lookup limit) no longer drops the warnings
+  already diagnosed at that level; `check_spf()` reports them with the
+  error
+
 ## 6.0.4
 
 ### Fixed

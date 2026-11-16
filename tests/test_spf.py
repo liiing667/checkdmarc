@@ -6,12 +6,16 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import dns.exception
+import dns.name
 import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import dns.rdtypes.ANY.TXT
 import dns.resolver
 import dns.rrset
 
 import checkdmarc.spf
+import checkdmarc.utils
 from checkdmarc.spf import (
     ParsedSPFMXMechanism,
     SPFAMechanism,
@@ -2738,6 +2742,306 @@ class TestTxtCnameConflictWiring(unittest.TestCase):
         assert redirect is not None
         self.assertTrue(
             any("both a TXT record and a CNAME" in w for w in redirect["warnings"])
+        )
+
+
+class FakeResolver(dns.resolver.Resolver):
+    """A minimal ``dns.resolver.Resolver`` stand-in that serves a static zone.
+
+    Injected through the ``resolver`` argument of the checkdmarc.spf
+    functions so tests can evaluate SPF records deterministically: every
+    DNS query is answered from ``zone`` and recorded in ``queries``, with
+    no network access and no function patching.
+    """
+
+    def __init__(self, zone: dict[tuple[str, str], list[str]]):
+        super().__init__(configure=False)
+        # zone maps (domain, record type) to rdata in presentation format
+        self.zone = zone
+        self.queries: list[tuple[str, str]] = []
+        # query_dns() passes the resolver's lifetime attribute to resolve()
+        self.lifetime = 5.0
+
+    def resolve(
+        self,
+        qname: dns.name.Name | str,
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.A,
+        rdclass: dns.rdataclass.RdataClass | str = dns.rdataclass.IN,
+        tcp: bool = False,
+        source: str | None = None,
+        raise_on_no_answer: bool = True,
+        source_port: int = 0,
+        lifetime: float | None = None,
+        search: bool | None = None,
+    ) -> dns.resolver.Answer:
+        name = str(qname).rstrip(".").lower()
+        rdtype = str(rdtype).upper()
+        self.queries.append((name, rdtype))
+        key = (name, rdtype)
+        if key not in self.zone:
+            # A name known with other record types answers NODATA; an
+            # unknown name is NXDOMAIN
+            if any(zone_name == name for zone_name, _ in self.zone):
+                raise dns.resolver.NoAnswer()
+            raise dns.resolver.NXDOMAIN()
+        # query_dns() only iterates the answer, so a list of rdata is a
+        # sufficient stand-in for dns.resolver.Answer
+        return cast(
+            dns.resolver.Answer,
+            [
+                dns.rdata.from_text(
+                    dns.rdataclass.IN, dns.rdatatype.from_text(rdtype), text
+                )
+                for text in self.zone[key]
+            ],
+        )
+
+    def query_count(self, name: str, rdtype: str) -> int:
+        """How many times this resolver was asked for (name, rdtype)"""
+        return self.queries.count((name, rdtype))
+
+
+def _spf_zone(records: dict[str, str]) -> dict[tuple[str, str], list[str]]:
+    """Builds fake-resolver zone entries publishing one SPF TXT record per domain"""
+    return {(domain, "TXT"): [f'"{record}"'] for domain, record in records.items()}
+
+
+class TestSPFSharedIncludeCache(unittest.TestCase):
+    """Deterministic evaluation with a shared include cache and an
+    injected fake resolver: every occurrence of a term counts against the
+    RFC 7208 section 4.6.4 budgets, repeat references reuse the cached
+    result instead of re-querying DNS, and failures keep the warnings
+    diagnosed before them."""
+
+    def setUp(self):
+        # query_dns() shares a process-wide cache; clear it so each test
+        # counts its own resolver queries
+        checkdmarc.utils.DNS_CACHE.clear()
+
+    def testRepeatIncludeCountsEveryOccurrenceButQueriesOnce(self):
+        """A repeated include counts against the lookup budget again
+        (RFC 7208 section 4.6.4) without re-querying DNS"""
+        zone = _spf_zone({"inc.example": "v=spf1 a:inc.example ~all"})
+        zone[("inc.example", "A")] = ["192.0.2.1"]
+        resolver = FakeResolver(zone)
+
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:inc.example include:inc.example ~all",
+            "top.example",
+            resolver=resolver,
+        )
+
+        # (1 include + 1 nested a) per occurrence
+        self.assertEqual(result["dns_lookups"], 4)
+        self.assertIn("Duplicate include: inc.example", result["warnings"])
+        self.assertEqual(resolver.query_count("inc.example", "TXT"), 1)
+
+    def testRepeatIncludeSharesNoMutableStateWithCache(self):
+        """The two occurrences of a repeated include share no mutable
+        state: the cache hands out immutable snapshots"""
+        zone = _spf_zone({"inc.example": "v=spf1 a:inc.example ~all"})
+        zone[("inc.example", "A")] = ["192.0.2.1"]
+        resolver = FakeResolver(zone)
+
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:inc.example include:inc.example ~all",
+            "top.example",
+            resolver=resolver,
+        )
+
+        includes = [
+            cast(SPFIncludeMechanism, m)
+            for m in result["parsed"]["mechanisms"]
+            if m["mechanism"] == "include"
+        ]
+        self.assertEqual(len(includes), 2)
+        self.assertIsNot(includes[0]["parsed"], includes[1]["parsed"])
+        self.assertIsNot(includes[0]["warnings"], includes[1]["warnings"])
+        # Editing one occurrence leaves the other untouched
+        cast(dict[str, Any], includes[0]["parsed"])["all"] = "fail"
+        includes[1]["warnings"].append("edited")
+        self.assertNotEqual(includes[0]["parsed"], includes[1]["parsed"])
+        self.assertNotEqual(includes[0]["warnings"], includes[1]["warnings"])
+
+    def testRedirectAndIncludeOfSameTargetAreOrderIndependent(self):
+        """A redirect and an include of the same target produce the same
+        counts and warnings regardless of their order in the record"""
+        zone = _spf_zone({"y.example": "v=spf1 a:y.example ~all"})
+        zone[("y.example", "A")] = ["192.0.2.1"]
+
+        outcomes = []
+        for record in (
+            "v=spf1 redirect=y.example include:y.example",
+            "v=spf1 include:y.example redirect=y.example",
+        ):
+            checkdmarc.utils.DNS_CACHE.clear()
+            resolver = FakeResolver(zone)
+            result = checkdmarc.spf.parse_spf_record(
+                record, "top.example", resolver=resolver
+            )
+            outcomes.append((result, resolver))
+
+        first, second = outcomes
+        self.assertEqual(first[0]["dns_lookups"], second[0]["dns_lookups"])
+        self.assertEqual(first[0]["void_dns_lookups"], second[0]["void_dns_lookups"])
+        self.assertEqual(first[0]["warnings"], second[0]["warnings"])
+        for result, resolver in outcomes:
+            self.assertFalse(any("Duplicate include" in w for w in result["warnings"]))
+            self.assertEqual(resolver.query_count("y.example", "TXT"), 1)
+
+    def testRepeatRedirectCountsEveryOccurrenceButQueriesOnce(self):
+        """Nested redirects to the same target each count against the
+        lookup budget while the target is queried once"""
+        zone = _spf_zone(
+            {
+                "a.example": "v=spf1 redirect=r.example",
+                "b.example": "v=spf1 redirect=r.example",
+                "r.example": "v=spf1 a:r.example ~all",
+            }
+        )
+        zone[("r.example", "A")] = ["192.0.2.1"]
+        resolver = FakeResolver(zone)
+
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:a.example include:b.example ~all",
+            "top.example",
+            resolver=resolver,
+        )
+
+        # Per branch: 1 include + 1 redirect + 1 nested a
+        self.assertEqual(result["dns_lookups"], 6)
+        self.assertEqual(resolver.query_count("r.example", "TXT"), 1)
+
+    def testRepeatIncludeCountsVoidLookupsPerOccurrence(self):
+        """Void lookups in a cached include target count again on every
+        occurrence, so the third repeat crosses the limit of 2"""
+        zone = _spf_zone({"void.example": "v=spf1 a:nx.example ~all"})
+
+        resolver = FakeResolver(zone)
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:void.example include:void.example ~all",
+            "top.example",
+            resolver=resolver,
+        )
+        self.assertEqual(result["void_dns_lookups"], 2)
+
+        checkdmarc.utils.DNS_CACHE.clear()
+        resolver = FakeResolver(zone)
+        with self.assertRaises(checkdmarc.spf.SPFTooManyVoidDNSLookups):
+            checkdmarc.spf.parse_spf_record(
+                "v=spf1 include:void.example include:void.example "
+                "include:void.example ~all",
+                "top.example",
+                resolver=resolver,
+            )
+
+    def testIncludeLoopReportsStableErrorType(self):
+        """An include loop raises SPFIncludeLoop no matter which side of
+        the loop the evaluation enters first"""
+        zone = _spf_zone(
+            {
+                "a.example": "v=spf1 include:b.example ~all",
+                "b.example": "v=spf1 include:a.example ~all",
+            }
+        )
+        for record in (
+            "v=spf1 include:a.example ~all",
+            "v=spf1 include:b.example ~all",
+        ):
+            with self.subTest(record=record):
+                checkdmarc.utils.DNS_CACHE.clear()
+                with self.assertRaises(checkdmarc.spf.SPFIncludeLoop):
+                    checkdmarc.spf.parse_spf_record(
+                        record, "top.example", resolver=FakeResolver(zone)
+                    )
+
+    def testRedirectLoopReportsStableErrorType(self):
+        """A redirect loop raises SPFRedirectLoop no matter which side of
+        the loop the evaluation enters first"""
+        zone = _spf_zone(
+            {
+                "a.example": "v=spf1 redirect=b.example",
+                "b.example": "v=spf1 redirect=a.example",
+            }
+        )
+        for record in ("v=spf1 redirect=a.example", "v=spf1 redirect=b.example"):
+            with self.subTest(record=record):
+                checkdmarc.utils.DNS_CACHE.clear()
+                with self.assertRaises(checkdmarc.spf.SPFRedirectLoop):
+                    checkdmarc.spf.parse_spf_record(
+                        record, "top.example", resolver=FakeResolver(zone)
+                    )
+
+    def testVoidLookupLimitErrorPreservesWarnings(self):
+        """When the void-lookup limit is exceeded while a mechanism warning
+        is being recorded, the error still carries every warning diagnosed
+        before it"""
+        zone = _spf_zone({"inc.example": "v=spf1 ptr ~all"})
+        zone[("inc.example", "A")] = ["192.0.2.1"]
+        resolver = FakeResolver(zone)
+
+        with self.assertRaises(checkdmarc.spf.SPFTooManyVoidDNSLookups) as context:
+            checkdmarc.spf.parse_spf_record(
+                "v=spf1 include:inc.example a:nx1.example a:nx2.example "
+                "a:nx3.example ~all",
+                "top.example",
+                resolver=resolver,
+            )
+
+        warnings = context.exception.warnings
+        self.assertTrue(any("ptr mechanism" in w for w in warnings))
+        for missing in ("nx1.example", "nx2.example", "nx3.example"):
+            self.assertTrue(
+                any(missing in w for w in warnings),
+                f"warning for {missing} missing from {warnings}",
+            )
+
+    def testCheckSpfErrorResultPreservesWarnings(self):
+        """check_spf() reports the warnings diagnosed before a fatal
+        void-lookup-limit error"""
+        zone = _spf_zone(
+            {
+                "top.example": "v=spf1 include:inc.example a:nx1.example "
+                "a:nx2.example a:nx3.example ~all",
+                "inc.example": "v=spf1 ptr ~all",
+            }
+        )
+        zone[("inc.example", "A")] = ["192.0.2.1"]
+        resolver = FakeResolver(zone)
+
+        result = checkdmarc.spf.check_spf("top.example", resolver=resolver)
+
+        self.assertFalse(result["valid"])
+        self.assertIn("void DNS lookups", result["error"])
+        self.assertTrue(any("ptr mechanism" in w for w in result["warnings"]))
+        self.assertTrue(any("nx1.example" in w for w in result["warnings"]))
+
+    def testNestedFailurePreservesDiagnosedWarnings(self):
+        """An include target that warns and then fails hands both the
+        warning and the error to the top-level evaluation"""
+        zone = _spf_zone({"bad.example": "v=spf1 unknownmod=x include:nx.example ~all"})
+        resolver = FakeResolver(zone)
+
+        with self.assertRaises(checkdmarc.spf.SPFRecordNotFound) as context:
+            checkdmarc.spf.parse_spf_record(
+                "v=spf1 include:bad.example ~all",
+                "top.example",
+                resolver=resolver,
+            )
+
+        self.assertTrue(
+            any("unknown modifier unknownmod" in w for w in context.exception.warnings)
+        )
+
+    def testSyntaxErrorPreservesEarlierWarnings(self):
+        """A fatal syntax error keeps the warnings diagnosed before it"""
+        with self.assertRaises(checkdmarc.spf.SPFSyntaxError) as context:
+            checkdmarc.spf.parse_spf_record(
+                "v=spf1 unknownmod=x ip4:999.0.0.1 ~all", "top.example"
+            )
+
+        self.assertTrue(
+            any("unknown modifier unknownmod" in w for w in context.exception.warnings)
         )
 
 
