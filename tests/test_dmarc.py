@@ -373,6 +373,97 @@ class Test(unittest.TestCase):
         self.assertEqual(result["tags"]["adkim"]["value"], "s")
         self.assertEqual(result["tags"]["aspf"]["value"], "s")
 
+    def testDMARCAlignmentStrictMatrix(self):
+        """Strict alignment (RFC 7489 § 3.1) requires an exact DNS domain
+        match; subdomains and suffix-lookalike domains never align"""
+        # Fixed domain matrix: (From domain, authenticated domain, aligned)
+        matrix = [
+            # Exact match, the only strict-aligned relationship
+            ("example.com", "example.com", True),
+            ("mail.example.com", "mail.example.com", True),
+            # Relaxed-only relationships: subdomains of the same org domain
+            ("example.com", "mail.example.com", False),
+            ("mail.example.com", "billing.example.com", False),
+            # Forged suffixes: a shared string suffix is not a shared label
+            ("example.com", "notexample.com", False),
+            ("example.co.uk", "notexample.co.uk", False),
+            ("mail.example.com", "mail.notexample.com", False),
+            # Unrelated organization
+            ("example.com", "example.net", False),
+        ]
+        for from_domain, authenticated_domain, expected in matrix:
+            with self.subTest(
+                from_domain=from_domain,
+                authenticated_domain=authenticated_domain,
+            ):
+                result = checkdmarc.dmarc.check_alignment(
+                    from_domain, authenticated_domain, "s"
+                )
+                self.assertEqual(result["aligned"], expected)
+                self.assertEqual(result["mode"], "s")
+
+    def testDMARCAlignmentRelaxedMatrix(self):
+        """Relaxed alignment (RFC 7489 § 3.1) compares Organizational
+        Domains, so subdomains of the same org align but suffix-lookalike
+        org domains stay separated"""
+        # Fixed domain matrix: (From domain, authenticated domain, aligned)
+        matrix = [
+            # Same org domain, including subdomain relationships
+            ("example.com", "example.com", True),
+            ("example.com", "mail.example.com", True),
+            ("mail.example.com", "billing.example.com", True),
+            ("example.co.uk", "mail.example.co.uk", True),
+            # Forged suffixes: the lookalike is its own org domain
+            ("example.com", "notexample.com", False),
+            ("example.co.uk", "notexample.co.uk", False),
+            ("mail.example.com", "mail.notexample.com", False),
+            # Unrelated organization
+            ("example.com", "example.net", False),
+        ]
+        for from_domain, authenticated_domain, expected in matrix:
+            with self.subTest(
+                from_domain=from_domain,
+                authenticated_domain=authenticated_domain,
+            ):
+                result = checkdmarc.dmarc.check_alignment(
+                    from_domain, authenticated_domain, "r"
+                )
+                self.assertEqual(result["aligned"], expected)
+                self.assertEqual(result["mode"], "r")
+
+    def testDMARCAlignmentNormalizationIsShared(self):
+        """The From domain, authenticated domain, and org domains share one
+        normalization: case differences and trailing root dots do not break
+        alignment, and the result carries the normalized forms"""
+        result = checkdmarc.dmarc.check_alignment(
+            "Mail.Example.COM.", "MAIL.example.com", "s"
+        )
+        self.assertTrue(result["aligned"])
+        self.assertEqual(result["from_domain"], "mail.example.com")
+        self.assertEqual(result["authenticated_domain"], "mail.example.com")
+
+        # Trailing dots on either side must also align in relaxed mode,
+        # including across a subdomain boundary
+        result = checkdmarc.dmarc.check_alignment(
+            "example.com.", "mail.example.com.", "r"
+        )
+        self.assertTrue(result["aligned"])
+        self.assertEqual(result["from_organizational_domain"], "example.com")
+        self.assertEqual(result["authenticated_organizational_domain"], "example.com")
+
+    def testDMARCAlignmentUnknownModeFailsClosed(self):
+        """An alignment mode other than s/r raises instead of silently
+        treating the identifiers as aligned or unaligned"""
+        for bad_mode in ("x", "strict", "R", "", "1"):
+            with self.subTest(mode=bad_mode):
+                self.assertRaises(
+                    checkdmarc.dmarc.InvalidDMARCAlignmentMode,
+                    checkdmarc.dmarc.check_alignment,
+                    "example.com",
+                    "example.com",
+                    bad_mode,
+                )
+
     def testDMARCDNSFilterToleratesWhitespaceAndCase(self):
         """The DNS-stage filter accepts whitespace around = and an
         uppercase V, consistent with the parser and the RFC 9989

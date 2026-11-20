@@ -159,7 +159,8 @@ def get_base_domain(domain: str) -> str:
 
 def normalize_domain(domain: str) -> str:
     """
-    Normalize an input domain by removing zero-width characters and lowercasing it
+    Normalize an input domain by removing zero-width characters, lowercasing
+    it, and stripping any trailing dot
 
     Args:
         domain (str): A domain or subdomain
@@ -172,7 +173,14 @@ def normalize_domain(domain: str) -> str:
     # 2. Remove zero-width and similar hidden chars
     domain = ZERO_WIDTH_RE.sub("", domain)
     # 3. Lowercase for case-insensitivity (domains are case-insensitive)
-    return domain.lower()
+    domain = domain.lower()
+    # 4. Strip the trailing root label. A trailing dot (RFC 1035 section 2.3.4,
+    #    "presentation name") only marks the name as fully qualified; it is not
+    #    part of the domain's labels, so "example.com." and "example.com" are
+    #    the same domain and must compare equal. Doing it here keeps every
+    #    comparison that relies on normalize_domain (including DMARC
+    #    alignment) on one canonical form.
+    return domain.rstrip(".")
 
 
 def _get_doh_session() -> httpx.Client:

@@ -221,6 +221,17 @@ class MultipleDMARCRecords(DMARCError):
     records disables DMARC (previously RFC 7489 § 6.6.3)"""
 
 
+class InvalidDMARCAlignmentMode(DMARCError):
+    """Raised when an alignment mode other than the RFC-defined ``s``
+    (strict) or ``r`` (relaxed) is passed to an alignment check.
+
+    Note that this differs from parsing an ``adkim``/``aspf`` tag out of a
+    DNS record: an unrecognized tag value is a discard rule with a fallback
+    to the default (see RFC 9989 § 4.8), while a programmatic alignment
+    evaluation with an unknown mode has no safe result to return, so it
+    fails closed instead of guessing."""
+
+
 class _DMARCGrammar(pyleri.Grammar):
     """Defines Pyleri grammar for DMARC records, following the RFC 9989
     §4.8 ABNF: dmarc-record = dmarc-version *(dmarc-sep dmarc-tag)
@@ -390,6 +401,22 @@ class DMARCErrorData(TypedDict, total=False):
     """Optional data structure for DMARCError"""
 
     target: str
+
+
+class DMARCAlignmentResult(TypedDict):
+    """The result of a DMARC Identifier Alignment evaluation
+    (RFC 7489 § 3.1)
+
+    Every domain carried in the result is the normalized form of the
+    corresponding input, so the two sides of the comparison and their
+    organizational domains share one canonical representation."""
+
+    aligned: bool
+    mode: Literal["s", "r"]
+    from_domain: str
+    authenticated_domain: str
+    from_organizational_domain: str
+    authenticated_organizational_domain: str
 
 
 dmarc_tags: DMARCTagMap = {
@@ -945,7 +972,7 @@ def query_dmarc_record(
         :exc:`checkdmarc.dmarc.SPFRecordFoundWhereDMARCRecordShouldBe`
 
     """
-    domain = normalize_domain(domain).rstrip(".")
+    domain = normalize_domain(domain)
     logger.debug(f"Checking for a DMARC record on {domain}")
     warnings = []
     location = domain
@@ -1079,6 +1106,79 @@ def query_dmarc_record(
         warnings.append(cname_warning)
 
     return {"record": record, "location": location, "warnings": warnings}
+
+
+def check_alignment(
+    from_domain: str, authenticated_domain: str, mode: str
+) -> DMARCAlignmentResult:
+    """
+    Evaluate DMARC Identifier Alignment between the RFC 5322 From domain and
+    an SPF- or DKIM-authenticated domain.
+
+    Both domains go through :func:`checkdmarc.utils.normalize_domain` first,
+    and each organizational domain is derived from that normalized form with
+    :func:`checkdmarc.utils.get_base_domain`, so the From domain, the
+    authenticated domain, and the organizational domains all share one
+    canonical representation. In particular, a trailing root dot is removed
+    before comparing, and suffix-lookalike names (for example
+    ``notexample.com`` against ``example.com``) cannot match by accident
+    because labels, not arbitrary substrings, are compared.
+
+    Args:
+        from_domain (str): The domain of the RFC 5322 From header address
+        authenticated_domain (str): The authenticated identifier — the
+            DKIM signing domain (the signature's ``d=`` tag) or the SPF
+            authenticated domain (the envelope domain that passed SPF)
+        mode (str): The alignment mode from the policy's ``adkim`` or
+            ``aspf`` tag: ``"s"`` for strict, ``"r"`` for relaxed
+
+    Returns:
+        DMARCAlignmentResult: The normalized inputs, their organizational
+            domains, the mode, and whether the identifiers are aligned
+
+    Raises:
+        InvalidDMARCAlignmentMode: If ``mode`` is anything other than
+            ``"s"`` or ``"r"``. The check fails closed rather than
+            assuming a default, because an unknown mode means the caller
+            is passing an unvalidated value and the result cannot be
+            trusted either way.
+    """
+    if mode not in ("s", "r"):
+        raise InvalidDMARCAlignmentMode(
+            f"{mode!r} is not a valid DMARC alignment mode: expected "
+            '"s" (strict) or "r" (relaxed)'
+        )
+
+    # One normalization path for every domain involved in the decision.
+    # RFC 7489 § 3.1 defines alignment on DNS domains, which are
+    # case-insensitive and may carry a presentation-form trailing dot.
+    normalized_from = normalize_domain(from_domain)
+    normalized_authenticated = normalize_domain(authenticated_domain)
+
+    # RFC 7489 § 3.1 relaxed mode compares Organizational Domains. The
+    # Public Suffix List-based boundary keeps a suffix-lookalike such as
+    # "notexample.com" from being treated as part of "example.com", and a
+    # multi-label suffix such as "example.co.uk" from being split one label
+    # too high.
+    from_org_domain = get_base_domain(normalized_from)
+    authenticated_org_domain = get_base_domain(normalized_authenticated)
+
+    if mode == "s":
+        # RFC 7489 § 3.1 strict: the two DNS domains must be identical.
+        aligned = normalized_from == normalized_authenticated
+    else:
+        # RFC 7489 § 3.1 relaxed: only the Organizational Domains must
+        # be identical; either side may be a subdomain of its org domain.
+        aligned = from_org_domain == authenticated_org_domain
+
+    return {
+        "aligned": aligned,
+        "mode": mode,
+        "from_domain": normalized_from,
+        "authenticated_domain": normalized_authenticated,
+        "from_organizational_domain": from_org_domain,
+        "authenticated_organizational_domain": authenticated_org_domain,
+    }
 
 
 def get_dmarc_tag_description(

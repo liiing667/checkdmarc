@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- DMARC: `check_alignment()` evaluates RFC 7489 section 3.1 Identifier
+  Alignment between an RFC 5322 From domain and an SPF- or DKIM-authenticated
+  domain in strict (`s`) or relaxed (`r`) mode, returning both normalized
+  domains and their organizational domains
+
+### Fixed
+
+- DMARC: `check_alignment()` compares whole DNS labels through the Public
+  Suffix List boundary, so suffix-lookalike domains such as
+  `notexample.com` can never align with `example.com` in either mode
+- DNS: `normalize_domain()` strips the trailing root dot so domains that
+  differ only by a presentation-form trailing dot share one canonical form
+  across the From domain, authenticated domain, and organizational domain
+  (RFC 1035 section 2.3.4)
+
+### Changed
+
+- DMARC: `check_alignment()` raises `InvalidDMARCAlignmentMode` for any mode
+  other than `s` or `r` instead of guessing, so an unknown mode fails closed
+
 ## 6.0.4
 
 ### Fixed

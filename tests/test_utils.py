@@ -67,6 +67,15 @@ class Test(unittest.TestCase):
         self.assertEqual(
             checkdmarc.utils.normalize_domain("example.com"), "example.com"
         )
+        # A trailing root label is presentation form, not a label: it must
+        # be stripped so the same domain compares equal with and without it
+        self.assertEqual(
+            checkdmarc.utils.normalize_domain("example.com."), "example.com"
+        )
+        self.assertEqual(
+            checkdmarc.utils.normalize_domain("Mail.Example.COM."),
+            "mail.example.com",
+        )
 
 
 def _fake_resolver():
