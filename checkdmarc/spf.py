@@ -958,21 +958,29 @@ def parse_spf_record(
             )
         return domain_part, ip4_cidr, ip6_cidr
 
-    def _check_exp_value(exp_value: str) -> None:
-        """Validate an exp value: macro syntax, or the TXT record behind it.
+    def _validate_exp_macro_syntax(exp_value: str) -> None:
+        """Validate the macro syntax of an exp value, without any DNS work.
 
-        RFC 7208 section 6.2: the explanation TXT lookup happens at
-        evaluation time and never counts toward the DNS lookup limits.
+        RFC 7208 section 7.2 allows the c, r, and t macro letters in
+        explanation text. This runs in the pre-DNS syntax pass, alongside
+        the mechanism domain-spec checks, so a malformed macro anywhere in
+        the record rejects it before a single query is sent.
         """
         if "%" in exp_value:
-            # RFC 7208 section 7.2 allows the c, r, and t macro letters in
-            # explanation text.
             _validate_spf_macros(
                 exp_value,
                 domain,
                 syntax_error_marker,
                 allow_exp_only_letters=True,
             )
+
+    def _lookup_exp_txt_record(exp_value: str) -> None:
+        """Look up the TXT record behind a macro-free exp value.
+
+        RFC 7208 section 6.2: the explanation TXT lookup happens at
+        evaluation time and never counts toward the DNS lookup limits.
+        """
+        if "%" in exp_value:
             return
         try:
             exp_txt_records = get_txt_records(
@@ -1098,6 +1106,10 @@ def parse_spf_record(
     # recorded once the first pass has read the terms before all, and
     # anything else is reported as ignored text.
     deferred_rfc6652_modifiers: list[tuple[str, str]] = []
+    # An exp modifier written after all gets its macro syntax checked here,
+    # but its TXT lookup is deferred until every term has passed syntax
+    # validation, so a bad macro anywhere stops all DNS traffic.
+    after_all_exp_value: str | None = None
     items_after_all: list[str] = AFTER_ALL_REGEX.findall(record)
     if len(items_after_all) > 0:
         extra_all_tokens: list[str] = []
@@ -1135,7 +1147,8 @@ def parse_spf_record(
                 # macro letters change how macros expand (RFC 7208 § 7.3).
                 parsed["exp"] = modifier_value
                 exp_seen = True
-                _check_exp_value(modifier_value)
+                _validate_exp_macro_syntax(modifier_value)
+                after_all_exp_value = modifier_value
             elif modifier_name in RFC6652_MODIFIERS:
                 # Held back so that a modifier written both before and after
                 # all is recorded in the order the record lists it, and the
@@ -1175,6 +1188,13 @@ def parse_spf_record(
         raw_value = raw_value or ""
         name = raw_name.lower()
         value = raw_value.lower()
+        if "%" in raw_value:
+            # RFC 7208 section 7.3: an uppercase macro letter URL-encodes
+            # its expansion, so letter case changes what a macro-string
+            # means. Validate and record the value exactly as written — the
+            # same string a receiver would expand — rather than a
+            # lowercased copy that could expand to a different target.
+            value = raw_value
         if sep == "=":
             # Modifiers. The RFC 7208 section 12 ABNF does not allow a
             # qualifier on a modifier.
@@ -1192,6 +1212,14 @@ def parse_spf_record(
             elif name == "exp":
                 if value == "":
                     raise SPFSyntaxError("The exp modifier is missing a value")
+                if exp_seen:
+                    # RFC 7208 § 6: an exp modifier that appears more than
+                    # once is a permerror, wherever the copies are.
+                    raise SPFSyntaxError("Multiple exp values are not permitted")
+                exp_seen = True
+                # Same pre-DNS macro validation as the mechanism
+                # domain-specs, with the exp-only letters allowed.
+                _validate_exp_macro_syntax(raw_value)
             elif name in RFC6652_MODIFIERS:
                 # ra=, rp=, and rr= are reporting modifiers defined by RFC 6652
                 # § 3. Their validation needs no DNS work, so they are not
@@ -1294,6 +1322,13 @@ def parse_spf_record(
     # they are recorded after the first pass has read the ones before it.
     for deferred_name, deferred_value in deferred_rfc6652_modifiers:
         _record_rfc6652_modifier(deferred_name, deferred_value)
+
+    # Every term has passed syntax validation by this point, so looking up
+    # the TXT record of an exp modifier written after all cannot be
+    # triggered by a record that a malformed macro will reject. RFC 7208
+    # section 6.2 keeps this lookup outside the DNS lookup limits.
+    if after_all_exp_value is not None:
+        _lookup_exp_txt_record(after_all_exp_value)
 
     # Second pass: process the validated terms, resolving DNS where needed
     # and enforcing the RFC 7208 section 4.6.4 lookup limits after every
@@ -1552,11 +1587,10 @@ def parse_spf_record(
                 # record, so honor exp even before the all mechanism. The
                 # exp value keeps its original case because uppercase macro
                 # letters change how macros expand (RFC 7208 section 7.3).
-                if exp_seen:
-                    raise SPFSyntaxError("Multiple exp values are not permitted")
-                exp_seen = True
+                # Macro syntax and duplicates were checked in the first
+                # pass; only the TXT lookup remains.
                 parsed["exp"] = raw_value
-                _check_exp_value(raw_value)
+                _lookup_exp_txt_record(raw_value)
 
             elif mechanism == "include":
                 if "%" in value:

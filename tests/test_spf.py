@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
 import dns.exception
@@ -1031,6 +1031,167 @@ class TestSPFMacroValidation(unittest.TestCase):
             checkdmarc.spf.parse_spf_record,
             "v=spf1 ip6:%{i} -all",
             "example.com",
+        )
+
+
+class TestSPFMacroIdentity(unittest.TestCase):
+    """Macro letters, recorded domains, and DNS targets share one identity.
+
+    A fixed fake resolver serves a small zone and records every query, so
+    each matrix row shows exactly which DNS targets a record produces —
+    and rejected records must produce none at all (fail closed).
+    """
+
+    ZONE: ClassVar[dict[tuple[str, str], list[str]]] = {
+        ("_spf.example.com", "TXT"): ["v=spf1 include:%{d}.nested.example.com -all"],
+        ("_spf-bad-exp.example.com", "TXT"): ["v=spf1 a:example.com exp=%{?}"],
+        ("exp.example", "TXT"): ["Explanation text"],
+        ("example.com", "A"): ["192.0.2.1"],
+        ("example.com", "AAAA"): ["2001:db8::1"],
+    }
+
+    def setUp(self):
+        self.queries: list[tuple[str, str]] = []
+
+        def fake_query_dns(domain, record_type, **kwargs):
+            self.queries.append((domain, record_type))
+            if record_type == "SPF":
+                return []
+            answers = self.ZONE.get((domain.lower(), record_type))
+            if answers is None:
+                raise dns.resolver.NoAnswer
+            return answers
+
+        # spf.py queries through its own imported reference while the
+        # get_*_records helpers use the one in utils; patch both names so
+        # every DNS path leads to the same fake resolver.
+        self._patches = [
+            patch("checkdmarc.spf.query_dns", side_effect=fake_query_dns),
+            patch("checkdmarc.utils.query_dns", side_effect=fake_query_dns),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def testValidMacroRecordsShareOneIdentity(self):
+        """Legal macros in mechanisms, exp text, and nested includes are accepted"""
+        valid_records = [
+            # Macro domain-specs in DNS-querying mechanisms: accepted, and
+            # never resolved statically, so no DNS target exists.
+            "v=spf1 a:%{l}.example.com mx:%{d} exists:%{i}._spf.example.com -all",
+            "v=spf1 include:%{d}._spf.example.com -all",
+            "v=spf1 redirect=%{d}._spf.example.com",
+            # The c, r, and t letters are in bounds for explanation text.
+            "v=spf1 -all exp=%{r}.%{d}.explain.example.com",
+            # Escapes and transformers keep the same meaning everywhere.
+            "v=spf1 exists:%{iR}._spf.example.com -all",
+            "v=spf1 -all exp=100%%-sure.%_{d}.example",
+        ]
+        for record in valid_records:
+            with self.subTest(record=record):
+                self.queries.clear()
+                result = checkdmarc.spf.parse_spf_record(record, "example.com")
+                self.assertNotIn("error", result)
+                # None of these records may trigger a DNS query.
+                self.assertEqual(self.queries, [])
+
+    def testRejectedMacrosFailClosed(self):
+        """Unknown or out-of-bounds macros are rejected before any DNS query"""
+        rejected_records = [
+            # Unknown macro letter.
+            "v=spf1 redirect=%{z}.example.com",
+            "v=spf1 -all exp=%{?}",
+            # The exp-only letters are out of bounds in mechanism domains.
+            "v=spf1 include:%{c}._spf.example.com -all",
+            "v=spf1 exists:%{t}._spf.example.com -all",
+            # A zero transformer is out of bounds (RFC 7208 § 7.1: *DIGIT).
+            "v=spf1 mx:%{d0} -all",
+            # A delimiter outside the RFC 7208 § 7.1 set.
+            "v=spf1 exists:%{d$}._spf.example.com -all",
+            # Truncated macros: a lone %, a non-escape after %, an
+            # unterminated {, and an empty macro body.
+            "v=spf1 exists:truncated% -all",
+            "v=spf1 exists:%x.example.com -all",
+            "v=spf1 exists:%{d.example.com -all",
+            "v=spf1 exists:%{}.example.com -all",
+            # A bad exp macro must not be reached through earlier DNS work:
+            # the a mechanism would otherwise query first.
+            "v=spf1 a:example.com exp=%{?}",
+            # A bad mechanism macro must not let the macro-free exp value
+            # send a TXT query to its domain.
+            "v=spf1 include:%{?}._spf.example.com -all exp=exp.example",
+            # A duplicate exp modifier is a permerror, found before DNS.
+            "v=spf1 exp=exp.example exp=other.example -all",
+        ]
+        for record in rejected_records:
+            with self.subTest(record=record):
+                self.queries.clear()
+                self.assertRaises(
+                    checkdmarc.spf.SPFSyntaxError,
+                    checkdmarc.spf.parse_spf_record,
+                    record,
+                    "example.com",
+                )
+                # Fail closed: rejection happens before any DNS traffic.
+                self.assertEqual(self.queries, [])
+
+    def testMacroLetterCaseIsPreserved(self):
+        """Mechanism values keep macro letter case, as exp values already do.
+
+        RFC 7208 § 7.3 makes case significant (uppercase URL-encodes the
+        expansion), so the recorded value must be the string a receiver
+        would expand, not a lowercased copy.
+        """
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:%{S}._spf.example.com -all", "example.com"
+        )
+        include = cast(SPFIncludeMechanism, result["parsed"]["mechanisms"][0])
+        self.assertEqual(include["value"], "%{S}._spf.example.com")
+        self.assertEqual(self.queries, [])
+
+    def testMacroFreeExpQueriesOnlyItsOwnDomain(self):
+        """A macro-free exp value queries exactly its own domain, after validation"""
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 -all exp=exp.example", "example.com"
+        )
+        self.assertEqual(result["parsed"]["exp"], "exp.example")
+        self.assertEqual(self.queries, [("exp.example", "TXT")])
+
+    def testNestedIncludeSharesTheSameBoundaries(self):
+        """A nested include's macro include is accepted without extra queries"""
+        result = checkdmarc.spf.parse_spf_record(
+            "v=spf1 include:_spf.example.com -all", "example.com"
+        )
+        self.assertNotIn("error", result)
+        # Only the include target itself is fetched; the nested macro
+        # include is not resolved statically. The CNAME query is the
+        # TXT-plus-CNAME conflict check in query_spf_record().
+        self.assertEqual(
+            self.queries,
+            [
+                ("_spf.example.com", "SPF"),
+                ("_spf.example.com", "TXT"),
+                ("_spf.example.com", "CNAME"),
+            ],
+        )
+
+    def testNestedBadExpMacroFailsWithoutNestedDns(self):
+        """A bad exp macro in an included record stops that record's DNS work"""
+        self.assertRaises(
+            checkdmarc.spf.SPFSyntaxError,
+            checkdmarc.spf.parse_spf_record,
+            "v=spf1 include:_spf-bad-exp.example.com -all",
+            "example.com",
+        )
+        # Fetching the include target is unavoidable; its own a mechanism
+        # and exp value must never be queried.
+        self.assertEqual(
+            self.queries,
+            [
+                ("_spf-bad-exp.example.com", "SPF"),
+                ("_spf-bad-exp.example.com", "TXT"),
+                ("_spf-bad-exp.example.com", "CNAME"),
+            ],
         )
 
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- SPF: validate `exp` macro syntax in the pre-DNS pass like every other
+  term, and defer the `exp` TXT lookup until the whole record has passed
+  syntax validation, so a record with a malformed macro is rejected without
+  sending any DNS query — previously an `exp` value after `all` was looked
+  up before mechanism macros were checked, and an `exp` value before `all`
+  was checked only after earlier mechanisms had already queried DNS
+- SPF: keep the original letter case of macro-strings in mechanism and
+  modifier values instead of recording a lowercased copy, because an
+  uppercase macro letter URL-encodes its expansion (RFC 7208 section 7.3),
+  so the recorded value is now the same string a receiver would expand
+
 ## 6.0.4
 
 ### Fixed
