@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Sequence
@@ -156,6 +157,11 @@ class MTASTSPolicySyntaxError(MTASTSPolicyError):
     """Raised when a syntax error is found in an MTA-STS policy"""
 
 
+class MTASTSPinError(MTASTSError):
+    """Raised when a pinned MTA-STS publishing identity does not match
+    the policy currently served"""
+
+
 class MTASTSQueryResult(TypedDict):
     record: str
     warnings: list[str]
@@ -208,11 +214,46 @@ class MTASTSPolicyParsingResults(TypedDict):
     warnings: list[str]
 
 
+class MTASTSPin(TypedDict):
+    """A fixed, offline copy of an MTA-STS publishing identity.
+
+    The hash, domain, MX set, and max_age together describe one
+    publication of a policy, so a replacement policy or a similar policy
+    domain cannot silently reuse trust previously granted to this pin."""
+
+    domain: str
+    # Lowercase hex SHA-256 digest of the exact policy bytes served over
+    # HTTPS, computed by mta_sts_policy_hash()
+    policy_hash: str
+    mx: list[str]
+    max_age: int
+
+
+class MTASTSPinVerification(TypedDict):
+    # "hit": the served policy hash and every other field match the pin;
+    # "compatible": the hash differs but the MX set is unchanged and
+    # max_age was not shortened; "mismatch": the pin no longer matches and
+    # relying on the served policy would break the pinned identity
+    status: Literal["hit", "compatible", "mismatch"]
+    pinned: MTASTSPin
+    observed: dict[str, object]
+    # Per-field conflicts for a mismatch; empty for a hit or compatible
+    # result
+    conflicts: list[str]
+    # Non-breaking differences for a compatible result; empty otherwise
+    warnings: list[str]
+
+
 class MTASTSCheckSuccess(TypedDict):
     valid: Literal[True]
     id: str
     policy: ParsedMTASTSPolicy
     warnings: list[str]
+
+
+class MTASTSCheckSuccessWithPin(MTASTSCheckSuccess, total=False):
+    # Present only when check_mta_sts() was given a pin
+    pin: MTASTSPinVerification
 
 
 class MTASTSCheckFailure(TypedDict):
@@ -223,7 +264,18 @@ class MTASTSCheckFailure(TypedDict):
     warnings: list[str]
 
 
-MTASTSCheckResult = MTASTSCheckSuccess | MTASTSCheckFailure
+class MTASTSCheckFailureWithPin(MTASTSCheckFailure, total=False):
+    # Present only when the failure came from a pin mismatch, so callers
+    # can see exactly which fields conflicted
+    pin: MTASTSPinVerification
+
+
+MTASTSCheckResult = (
+    MTASTSCheckSuccess
+    | MTASTSCheckSuccessWithPin
+    | MTASTSCheckFailure
+    | MTASTSCheckFailureWithPin
+)
 # Deprecated alias for MTASTSCheckResult
 MTASTSCheckResults = MTASTSCheckResult
 
@@ -725,6 +777,186 @@ def parse_mta_sts_policy(policy: str) -> MTASTSPolicyParsingResults:
     return results
 
 
+def mta_sts_policy_hash(policy: str | bytes) -> str:
+    """Returns the lowercase hex SHA-256 digest of a policy body.
+
+    The digest covers the exact bytes served over HTTPS (before any line
+    ending or whitespace normalization), so two policies that parse to
+    the same fields but differ in whitespace or ordering get different
+    hashes. A ``str`` is encoded as UTF-8, which every valid policy uses
+    (RFC 8461 section 3.2 values are visible ASCII or UTF-8).
+
+    Args:
+        policy (str | bytes): The raw policy body
+
+    Returns:
+        str: The lowercase hex SHA-256 digest
+    """
+    if isinstance(policy, str):
+        policy = policy.encode("utf-8")
+    return hashlib.sha256(policy).hexdigest()
+
+
+def _normalize_mta_sts_pin(pin: MTASTSPin) -> MTASTSPin:
+    """Validates a pin and returns a normalized copy.
+
+    Normalization pins the same case and ordering rules used when
+    comparing against a served policy, so the comparison is not affected
+    by cosmetic differences in how the pin was written down.
+
+    Raises:
+        :exc:`checkdmarc.mta_sts.MTASTSPinError`: the pin is missing a
+            required field or carries an invalid value
+    """
+    required_fields = ("domain", "policy_hash", "mx", "max_age")
+    missing = [field for field in required_fields if field not in pin]
+    if missing:
+        raise MTASTSPinError(
+            "The MTA-STS pin is missing required field(s): " + ", ".join(missing) + "."
+        )
+    domain = normalize_domain(pin["domain"])
+    policy_hash = pin["policy_hash"].strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", policy_hash) is None:
+        raise MTASTSPinError(
+            "The MTA-STS pin policy_hash must be a 64-character hex SHA-256 digest."
+        )
+    mx = pin["mx"]
+    if not isinstance(mx, list) or len(mx) == 0:
+        raise MTASTSPinError("The MTA-STS pin must list at least one mx value.")
+    normalized_mx: list[str] = []
+    for pattern in mx:
+        if MTA_STS_MX_REGEX.fullmatch(pattern) is None:
+            raise MTASTSPinError(f"The MTA-STS pin has an invalid mx value: {pattern}")
+        normalized_mx.append(pattern.lower())
+    max_age = pin["max_age"]
+    if isinstance(max_age, bool) or not isinstance(max_age, int) or max_age < 0:
+        raise MTASTSPinError(
+            "The MTA-STS pin max_age must be a non-negative integer number of seconds."
+        )
+    normalized: MTASTSPin = {
+        "domain": domain,
+        "policy_hash": policy_hash,
+        "mx": normalized_mx,
+        "max_age": max_age,
+    }
+    return normalized
+
+
+def verify_mta_sts_pin(
+    *,
+    domain: str,
+    pin: MTASTSPin,
+    policy_text: str,
+    parsed_policy: ParsedMTASTSPolicy,
+) -> MTASTSPinVerification:
+    """Checks a served MTA-STS policy against a fixed publishing identity.
+
+    The pin binds four pieces of evidence together: the SHA-256 hash of
+    the policy body, the policy domain, the MX pattern set, and the
+    max_age lifetime. A replacement policy or a policy served by a
+    similar-looking domain cannot reuse trust granted to an earlier
+    publication: any hard conflict is reported as a ``mismatch`` rather
+    than silently accepted.
+
+    Args:
+        domain (str): The domain the policy was fetched for
+        pin (MTASTSPin): The fixed offline publishing identity
+        policy_text (str): The raw policy body served over HTTPS
+        parsed_policy (ParsedMTASTSPolicy): The parsed served policy
+
+    Returns:
+        MTASTSPinVerification: A ``hit`` (the exact pinned policy is
+            still served), ``compatible`` (the body changed, the MX set
+            is unchanged, and the max_age was not shortened), or
+            ``mismatch`` (the pin no longer holds) result with the
+            observed values and the per-field conflicts
+
+    Raises:
+        :exc:`checkdmarc.mta_sts.MTASTSPinError`: the pin itself is
+            malformed
+    """
+    normalized_pin = _normalize_mta_sts_pin(pin)
+    observed_hash = mta_sts_policy_hash(policy_text)
+    observed: dict[str, object] = {
+        "domain": normalize_domain(domain),
+        "policy_hash": observed_hash,
+        "mx": list(parsed_policy["mx"]),
+        "max_age": parsed_policy["max_age"],
+        "mode": parsed_policy["mode"],
+    }
+    conflicts: list[str] = []
+    soft_warnings: list[str] = []
+
+    # The domain is the HTTPS identity: a policy for another domain can
+    # never be a compatible update, so this always fails closed.
+    domain_mismatch = observed["domain"] != normalized_pin["domain"]
+    if domain_mismatch:
+        conflicts.append(
+            f"Domain mismatch: the pin is for {normalized_pin['domain']} but "
+            f"the policy was served for {observed['domain']}."
+        )
+
+    if observed_hash == normalized_pin["policy_hash"] and not domain_mismatch:
+        # An exact body match means the parsed fields are the pinned
+        # fields too; no further tolerance is needed or granted.
+        return MTASTSPinVerification(
+            status="hit",
+            pinned=normalized_pin,
+            observed=observed,
+            conflicts=[],
+            warnings=[],
+        )
+
+    # From here on the policy body has changed. Decide whether the change
+    # stays within the pinned trust boundary or breaks it.
+    pinned_mx = normalized_pin["mx"]
+    served_mx = [pattern.lower() for pattern in parsed_policy["mx"]]
+    # The MX set is part of the publishing identity, so the patterns are
+    # compared as literal strings (a wildcard pattern is itself a literal
+    # pin value, not a match to expand). Any added or removed pattern
+    # changes the identity; ordering alone does not matter for a set.
+    added_mx = [pattern for pattern in served_mx if pattern not in pinned_mx]
+    removed_mx = [pattern for pattern in pinned_mx if pattern not in served_mx]
+    if removed_mx or added_mx:
+        conflicts.append(
+            "MX set mismatch: the served MX pattern set differs from the "
+            f"pinned set (removed: {', '.join(removed_mx) or 'none'}; "
+            f"added: {', '.join(added_mx) or 'none'})."
+        )
+
+    if parsed_policy["max_age"] < normalized_pin["max_age"]:
+        conflicts.append(
+            "max_age mismatch: the served policy expires after "
+            f"{parsed_policy['max_age']} seconds, shorter than the pinned "
+            f"{normalized_pin['max_age']} seconds, so trust would expire earlier "
+            "than the pin allows."
+        )
+    elif parsed_policy["max_age"] > normalized_pin["max_age"]:
+        soft_warnings.append(
+            "max_age increased from the pinned "
+            f"{normalized_pin['max_age']} seconds to "
+            f"{parsed_policy['max_age']} seconds."
+        )
+
+    if conflicts:
+        status: Literal["hit", "compatible", "mismatch"] = "mismatch"
+    else:
+        status = "compatible"
+        soft_warnings.append(
+            "Policy body hash differs from the pin, but every pinned MX is "
+            "still published and max_age was not shortened, so the change "
+            "is compatible with the pinned publishing identity."
+        )
+
+    return MTASTSPinVerification(
+        status=status,
+        pinned=normalized_pin,
+        observed=observed,
+        conflicts=conflicts,
+        warnings=soft_warnings,
+    )
+
+
 def check_mta_sts(
     domain: str,
     *,
@@ -732,6 +964,7 @@ def check_mta_sts(
     resolver: dns.resolver.Resolver | None = None,
     timeout: float = DEFAULT_DNS_TIMEOUT,
     retries: int = DEFAULT_DNS_MAX_RETRIES,
+    pin: MTASTSPin | None = None,
 ) -> MTASTSCheckResult:
     """
     Returns a dictionary with a parsed MTA-STS policy or an error.
@@ -743,6 +976,11 @@ def check_mta_sts(
                                           requests
         timeout (float): number of seconds to wait for an answer from DNS
         retries (int): The number of times to retry on timeout or other transient errors
+        pin (MTASTSPin): An optional fixed, offline copy of the domain's
+                         MTA-STS publishing identity. When given, the
+                         served policy body hash, domain, MX set, and
+                         max_age are checked against it; a mismatch fails
+                         closed instead of trusting the replacement policy
 
 
     Returns:
@@ -752,6 +990,9 @@ def check_mta_sts(
                        - ``policy`` - The parsed MTA-STS policy
                        - ``valid`` - True
                        - ``warnings`` - A ``list`` of warnings
+                       - ``pin`` - Pin verification results, present only
+                         when ``pin`` was given; its ``status`` is one of
+                         ``hit``, ``compatible``, or ``mismatch``
 
                     If an error occurs, the dictionary will have the
                     following keys:
@@ -781,19 +1022,43 @@ def check_mta_sts(
         parsed_policy = parse_mta_sts_policy(download_results["policy"])
         warnings += parsed_policy["warnings"]
 
-        mta_sts_results: MTASTSCheckSuccess = {
+        pin_results: MTASTSPinVerification | None = None
+        if pin is not None:
+            pin_results = verify_mta_sts_pin(
+                domain=domain,
+                pin=pin,
+                policy_text=download_results["policy"],
+                parsed_policy=parsed_policy["policy"],
+            )
+            warnings += pin_results["warnings"]
+            if pin_results["status"] == "mismatch":
+                # Fail closed: a replacement policy or a similar policy
+                # domain must not reuse trust the pin granted to the
+                # original publishing identity
+                conflict_summary = " ".join(pin_results["conflicts"])
+                raise MTASTSPinError(
+                    "The served MTA-STS policy does not match the pinned "
+                    f"publishing identity. {conflict_summary}",
+                    data={"pin": pin_results},
+                )
+
+        mta_sts_results: MTASTSCheckSuccessWithPin = {
             "valid": True,
             "id": id_value,
             "policy": parsed_policy["policy"],
             "warnings": warnings,
         }
+        if pin_results is not None:
+            mta_sts_results["pin"] = pin_results
         return mta_sts_results
     except MTASTSError as error:
-        mta_sts_results_failure: MTASTSCheckFailure = {
+        mta_sts_results_failure: MTASTSCheckFailureWithPin = {
             "valid": False,
             "error": str(error),
             "warnings": warnings,
         }
+        if isinstance(error, MTASTSPinError) and error.data is not None:
+            mta_sts_results_failure["pin"] = error.data["pin"]
         return mta_sts_results_failure
 
 

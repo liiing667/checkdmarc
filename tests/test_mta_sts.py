@@ -1,5 +1,6 @@
 """Tests for checkdmarc.mta_sts"""
 
+import hashlib
 import unittest
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,27 @@ import dns.resolver
 import requests
 
 import checkdmarc.mta_sts
+
+
+def _sample_policy(
+    *,
+    mx: str = "mx: mail.example.com\r\n",
+    max_age: str = "86400",
+    mode: str = "enforce",
+) -> str:
+    return f"version: STSv1\r\nmode: {mode}\r\nmax_age: {max_age}\r\n{mx}"
+
+
+def _pin_for(
+    policy: str, *, domain: str = "example.com", max_age: int = 86400
+) -> checkdmarc.mta_sts.MTASTSPin:
+    parsed = checkdmarc.mta_sts.parse_mta_sts_policy(policy)["policy"]
+    return {
+        "domain": domain,
+        "policy_hash": checkdmarc.mta_sts.mta_sts_policy_hash(policy),
+        "mx": list(parsed["mx"]),
+        "max_age": max_age,
+    }
 
 
 class Test(unittest.TestCase):
@@ -774,6 +796,260 @@ class TestTxtCnameConflictWiring(unittest.TestCase):
         self.assertTrue(
             any("both a TXT record and a CNAME" in w for w in result["warnings"])
         )
+
+
+class TestMtaStsPolicyHash(unittest.TestCase):
+    def testHashIsStableSha256Hex(self):
+        """mta_sts_policy_hash returns the SHA-256 digest of the exact
+        policy bytes as lowercase hex"""
+        policy = "version: STSv1\nmode: none\nmax_age: 0\n"
+        expected = hashlib.sha256(policy.encode("utf-8")).hexdigest()
+        self.assertEqual(checkdmarc.mta_sts.mta_sts_policy_hash(policy), expected)
+        self.assertEqual(len(expected), 64)
+        self.assertEqual(expected, expected.lower())
+
+    def testHashCoversExactBytes(self):
+        """Policies that parse identically but differ in bytes get
+        different hashes, so a rewritten policy body cannot claim the
+        pinned hash"""
+        lf = "version: STSv1\nmode: none\nmax_age: 0\n"
+        crlf = "version: STSv1\r\nmode: none\r\nmax_age: 0\r\n"
+        self.assertEqual(
+            checkdmarc.mta_sts.parse_mta_sts_policy(lf)["policy"],
+            checkdmarc.mta_sts.parse_mta_sts_policy(crlf)["policy"],
+        )
+        self.assertNotEqual(
+            checkdmarc.mta_sts.mta_sts_policy_hash(lf),
+            checkdmarc.mta_sts.mta_sts_policy_hash(crlf),
+        )
+
+    def testHashAcceptsBytes(self):
+        raw = b"version: STSv1\n"
+        self.assertEqual(
+            checkdmarc.mta_sts.mta_sts_policy_hash(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+
+
+class TestVerifyMtaStsPin(unittest.TestCase):
+    DOMAIN = "example.com"
+
+    def _verify(
+        self,
+        pin: checkdmarc.mta_sts.MTASTSPin,
+        served: str,
+        *,
+        domain: str | None = None,
+    ):
+        parsed = checkdmarc.mta_sts.parse_mta_sts_policy(served)["policy"]
+        return checkdmarc.mta_sts.verify_mta_sts_pin(
+            domain=domain or self.DOMAIN,
+            pin=pin,
+            policy_text=served,
+            parsed_policy=parsed,
+        )
+
+    def testHitWhenExactPolicyServed(self):
+        """The same policy body produces the same hash and a hit, with
+        the observed identity echoed back"""
+        policy = _sample_policy()
+        result = self._verify(_pin_for(policy), policy)
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(
+            result["observed"]["policy_hash"], result["pinned"]["policy_hash"]
+        )
+        self.assertEqual(result["observed"]["domain"], self.DOMAIN)
+        self.assertEqual(result["observed"]["mx"], ["mail.example.com"])
+        self.assertEqual(result["observed"]["max_age"], 86400)
+
+    def testHitIsCaseAndOrderInsensitiveForMx(self):
+        """A hit only depends on the body hash; the pin normalizes MX
+        case so cosmetic pin notation does not invalidate it"""
+        policy = _sample_policy(mx="mx: mail.example.com\r\nmx: *.example.com\r\n")
+        pin = _pin_for(policy)
+        pin["mx"] = ["MAIL.EXAMPLE.COM", "*.EXAMPLE.COM"]
+        result = self._verify(pin, policy)
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["pinned"]["mx"], ["mail.example.com", "*.example.com"])
+
+    def testReplacementPolicyWithRemovedMxFailsClosed(self):
+        """A replacement policy that drops a pinned MX host is a
+        mismatch: the new publication cannot reuse the old trust"""
+        pinned_policy = _sample_policy(mx="mx: mail.example.com\r\n")
+        served_policy = _sample_policy(mx="mx: attacker.example.com\r\n")
+        result = self._verify(_pin_for(pinned_policy), served_policy)
+        self.assertEqual(result["status"], "mismatch")
+        self.assertTrue(any("MX set mismatch" in c for c in result["conflicts"]))
+        self.assertIn("mail.example.com", " ".join(result["conflicts"]))
+        self.assertIn("attacker.example.com", " ".join(result["conflicts"]))
+
+    def testAddedMxIsAlsoMismatch(self):
+        """Adding an MX host changes the published set, so it is a
+        mismatch rather than silently extending trust to the new host"""
+        pinned_policy = _sample_policy(mx="mx: mail.example.com\r\n")
+        served_policy = _sample_policy(
+            mx="mx: mail.example.com\r\nmx: new-mail.example.com\r\n"
+        )
+        result = self._verify(_pin_for(pinned_policy), served_policy)
+        self.assertEqual(result["status"], "mismatch")
+        self.assertIn("new-mail.example.com", " ".join(result["conflicts"]))
+
+    def testSimilarPolicyDomainFailsClosed(self):
+        """A policy served from a look-alike domain never matches a pin
+        for the real domain, even if its body would otherwise fit"""
+        policy = _sample_policy()
+        result = self._verify(_pin_for(policy), policy, domain="examp1e.com")
+        self.assertEqual(result["status"], "mismatch")
+        conflict_text = " ".join(result["conflicts"])
+        self.assertIn("Domain mismatch", conflict_text)
+        self.assertIn("examp1e.com", conflict_text)
+
+    def testShortenedMaxAgeIsMismatch(self):
+        """A shorter max_age expires trust earlier than the pin allows,
+        so it breaks the pinned lifetime"""
+        pinned_policy = _sample_policy(max_age="86400")
+        served_policy = _sample_policy(max_age="3600")
+        pin = _pin_for(pinned_policy, max_age=86400)
+        result = self._verify(pin, served_policy)
+        self.assertEqual(result["status"], "mismatch")
+        self.assertTrue(any("max_age mismatch" in c for c in result["conflicts"]))
+
+    def testCompatibleWhenOnlyMaxAgeIncreases(self):
+        """A longer max_age with the same MX set keeps every pinned
+        guarantee, so it is compatible and reported as a warning"""
+        pinned_policy = _sample_policy(max_age="86400")
+        served_policy = _sample_policy(max_age="172800")
+        pin = _pin_for(pinned_policy, max_age=86400)
+        result = self._verify(pin, served_policy)
+        self.assertEqual(result["status"], "compatible")
+        self.assertEqual(result["conflicts"], [])
+        self.assertTrue(any("max_age increased" in w for w in result["warnings"]))
+
+    def testCompatibleWhenMxOrderChanges(self):
+        """The same MX patterns in a different order is still the same
+        published set"""
+        pinned_policy = _sample_policy(
+            mx="mx: mail.example.com\r\nmx: backup.example.com\r\n"
+        )
+        served_policy = _sample_policy(
+            mx="mx: backup.example.com\r\nmx: mail.example.com\r\n"
+        )
+        pin = _pin_for(pinned_policy)
+        result = self._verify(pin, served_policy)
+        self.assertEqual(result["status"], "compatible")
+        self.assertEqual(result["conflicts"], [])
+
+    def testMalformedPinRejected(self):
+        """A pin missing fields or carrying invalid values raises rather
+        than producing a misleading result"""
+        policy = _sample_policy()
+        good_pin = _pin_for(policy)
+        cases: list[tuple[dict[str, Any], str]] = [
+            ({"domain": self.DOMAIN}, "missing required field"),
+            ({**good_pin, "policy_hash": "abc"}, "64-character hex"),
+            ({**good_pin, "mx": []}, "at least one mx"),
+            ({**good_pin, "mx": ["not a hostname!"]}, "invalid mx"),
+            ({**good_pin, "max_age": -1}, "non-negative integer"),
+            ({**good_pin, "max_age": "86400"}, "non-negative integer"),
+        ]
+        for bad_pin, expected_text in cases:
+            with self.subTest(bad_pin=bad_pin):
+                with self.assertRaises(checkdmarc.mta_sts.MTASTSPinError) as ctx:
+                    self._verify(cast(checkdmarc.mta_sts.MTASTSPin, bad_pin), policy)
+                self.assertIn(expected_text, str(ctx.exception))
+
+
+class TestCheckMtaStsPin(unittest.TestCase):
+    POLICY = (
+        "version: STSv1\r\nmode: enforce\r\nmax_age: 86400\r\nmx: mail.example.com\r\n"
+    )
+    RECORD = "v=STSv1; id=20240101T010101"
+
+    def _patch_live(self, policy: str = POLICY):
+        return (
+            patch(
+                "checkdmarc.mta_sts.query_mta_sts_record",
+                return_value={"record": self.RECORD, "warnings": []},
+            ),
+            patch(
+                "checkdmarc.mta_sts.download_mta_sts_policy",
+                return_value={"policy": policy, "warnings": []},
+            ),
+        )
+
+    def _pin(self, policy: str = POLICY) -> checkdmarc.mta_sts.MTASTSPin:
+        return {
+            "domain": "example.com",
+            "policy_hash": checkdmarc.mta_sts.mta_sts_policy_hash(policy),
+            "mx": ["mail.example.com"],
+            "max_age": 86400,
+        }
+
+    def testHitResultIncludesPin(self):
+        query_patch, download_patch = self._patch_live()
+        with query_patch, download_patch:
+            result = cast(
+                dict[str, Any],
+                checkdmarc.mta_sts.check_mta_sts("example.com", pin=self._pin()),
+            )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["pin"]["status"], "hit")
+
+    def testCompatibleResultStaysValidWithWarning(self):
+        served = self.POLICY.replace("max_age: 86400", "max_age: 172800")
+        query_patch, download_patch = self._patch_live(served)
+        with query_patch, download_patch:
+            result = cast(
+                dict[str, Any],
+                checkdmarc.mta_sts.check_mta_sts("example.com", pin=self._pin()),
+            )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["pin"]["status"], "compatible")
+        self.assertTrue(any("max_age increased" in w for w in result["warnings"]))
+
+    def testMismatchFailsClosed(self):
+        """check_mta_sts returns valid=False on a pin mismatch and keeps
+        the detailed conflict report instead of trusting the replacement
+        policy"""
+        served = self.POLICY.replace("mail.example.com", "attacker.example.com")
+        query_patch, download_patch = self._patch_live(served)
+        with query_patch, download_patch:
+            result = cast(
+                dict[str, Any],
+                checkdmarc.mta_sts.check_mta_sts("example.com", pin=self._pin()),
+            )
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["pin"]["status"], "mismatch")
+        self.assertIn("pinned publishing identity", result["error"])
+        self.assertTrue(result["pin"]["conflicts"])
+
+    def testNoPinMeansNoPinKey(self):
+        """Without a pin the result shape is unchanged for existing
+        callers"""
+        query_patch, download_patch = self._patch_live()
+        with query_patch, download_patch:
+            result = cast(
+                dict[str, Any], checkdmarc.mta_sts.check_mta_sts("example.com")
+            )
+        self.assertTrue(result["valid"])
+        self.assertNotIn("pin", result)
+
+    def testMalformedPinFailsClosed(self):
+        query_patch, download_patch = self._patch_live()
+        bad_pin = cast(dict[str, Any], self._pin())
+        bad_pin["policy_hash"] = "too short"
+        with query_patch, download_patch:
+            result = cast(
+                dict[str, Any],
+                checkdmarc.mta_sts.check_mta_sts(
+                    "example.com",
+                    pin=cast(checkdmarc.mta_sts.MTASTSPin, bad_pin),
+                ),
+            )
+        self.assertFalse(result["valid"])
+        self.assertIn("64-character hex", result["error"])
 
 
 if __name__ == "__main__":

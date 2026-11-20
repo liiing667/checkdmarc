@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- MTA-STS: `check_mta_sts()` now accepts an optional `pin` — a fixed,
+  offline copy of a policy's publishing identity made of the policy body
+  SHA-256 hash, the domain, the MX pattern set, and the `max_age`. The new
+  `mta_sts_policy_hash()` and `verify_mta_sts_pin()` helpers compute and
+  check that identity. A replacement policy or a similar policy domain can
+  no longer reuse old trust: any hard conflict returns `valid=False` with a
+  `mismatch` pin report (fail closed), an exact body match reports a `hit`,
+  and a changed body that keeps the same MX set without shortening
+  `max_age` reports `compatible` with a warning
+
 ## 6.0.4
 
 ### Fixed
