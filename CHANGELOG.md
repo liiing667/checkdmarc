@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Aggregate reports: `aggregate_domain_result()` combines the SPF, DMARC,
+  and sub-check statuses of a `DomainCheckResult` into one status —
+  `passed`, `partial`, `skipped`, `unknown`, or `error` — through the
+  fixed combination matrix in `checkdmarc/aggregate.py`. The combination
+  is monotonic: `error` and `partial` are terminal states, and a skipped
+  or unknown result degrades a clean run to `partial` rather than folding
+  into a complete success. Warnings stay attributed to the check that
+  produced them
+
 ## 6.0.4
 
 ### Fixed

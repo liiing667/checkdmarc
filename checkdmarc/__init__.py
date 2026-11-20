@@ -22,6 +22,24 @@ from checkdmarc._constants import (
 from checkdmarc._constants import (
     RECOMMENDED_DNS_NAMESERVERS as RECOMMENDED_DNS_NAMESERVERS,
 )
+from checkdmarc.aggregate import (
+    AggregateReport as AggregateReport,
+)
+from checkdmarc.aggregate import (
+    CheckStatus as CheckStatus,
+)
+from checkdmarc.aggregate import (
+    aggregate_check_statuses as aggregate_check_statuses,
+)
+from checkdmarc.aggregate import (
+    aggregate_domain_result as aggregate_domain_result,
+)
+from checkdmarc.aggregate import (
+    combine_statuses as combine_statuses,
+)
+from checkdmarc.aggregate import (
+    domain_check_statuses as domain_check_statuses,
+)
 from checkdmarc.bimi import BIMICheckResult, check_bimi
 from checkdmarc.dmarc import DMARCErrorResults, DMARCResults, check_dmarc
 from checkdmarc.dnssec import check_dnssec

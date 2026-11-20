@@ -7,6 +7,13 @@
    :members:
 ```
 
+## checkdmarc.aggregate
+
+```{eval-rst}
+.. automodule:: checkdmarc.aggregate
+   :members:
+```
+
 ## checkdmarc.bimi
 
 ```{eval-rst}
